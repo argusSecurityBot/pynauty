@@ -214,7 +214,28 @@ NyGraph * extend_canonical(NyGraph *g)
 
 //  Python functions  =========================================================
 
-static int set_partition(PyObject *py_graph, int *lab, int *ptn)
+static int get_vertex(PyObject *obj, int n, int *v)
+// Convert a Python int into a vertex number 0 <= *v < n
+{
+    int overflow;
+    long x;
+
+    x = PyLong_AsLongAndOverflow(obj, &overflow);
+    if (x == -1 && PyErr_Occurred()) {
+        return 0;       // error
+    }
+    if (overflow || x < 0 || x >= n) {
+        PyErr_Format(PyExc_ValueError,
+                "vertex %S conflicts with number_of_vertices=%d", obj, n);
+        return 0;       // error
+    }
+    *v = (int) x;
+    return 1;
+}
+
+
+static int set_partition(PyObject *py_graph, int *lab, int *ptn,
+        int no_vertices)
 // Convert the vertex_coloring attribute of a NyGraph object
 // into nauty (lab, ptn) data structure at partition level 0
 {
@@ -243,12 +264,21 @@ static int set_partition(PyObject *py_graph, int *lab, int *ptn)
         iterator = PyObject_GetIter(pyset);
         
         while ((item = PyIter_Next(iterator))) {
-#if PY_MAJOR_VERSION >= 3
-            x = PyLong_AS_LONG(item);
-#else
-            x = PyInt_AS_LONG(item);
-#endif
+            if (!get_vertex(item, no_vertices, &x)) {
+                Py_DECREF(item);
+                Py_DECREF(iterator);
+                Py_DECREF(partition);
+                return 0;       // error
+            }
             Py_DECREF(item);
+            if (n >= no_vertices) {
+                PyErr_Format(PyExc_ValueError,
+                        "Invalid partition: more than number_of_vertices=%d "
+                        "vertices", no_vertices);
+                Py_DECREF(iterator);
+                Py_DECREF(partition);
+                return 0;       // error
+            }
             lab[n] = x;
             ptn[n++] = 1;
         }
@@ -333,6 +363,8 @@ NyGraph * _make_nygraph(PyObject *py_graph)
     int i;
     int adjlist_length;
     int x, y;
+    int overflow;
+    long nv;
 
     // get the number of vertices
     if ((p = PyObject_GetAttrString(py_graph, "number_of_vertices")) == NULL) {
@@ -340,11 +372,18 @@ NyGraph * _make_nygraph(PyObject *py_graph)
                 "Missing 'number_of_vertices' attribute");
         return NULL;
     }
-#if PY_MAJOR_VERSION >= 3
-    n = PyLong_AS_LONG(p);
-#else
-    n = PyInt_AS_LONG(p);
-#endif
+    nv = PyLong_AsLongAndOverflow(p, &overflow);
+    if (nv == -1 && PyErr_Occurred()) {
+        Py_DECREF(p);
+        return NULL;
+    }
+    if (overflow || nv < 0 || nv > INT_MAX - WORDSIZE + 1) {
+        PyErr_Format(PyExc_ValueError,
+                "number_of_vertices=%S is out of range", p);
+        Py_DECREF(p);
+        return NULL;
+    }
+    n = (int) nv;
     Py_DECREF(p);
 
     // create an empty Nauty NyGraph object
@@ -356,6 +395,7 @@ NyGraph * _make_nygraph(PyObject *py_graph)
     // get directed attribute
     if ((p = PyObject_GetAttrString(py_graph, "directed")) == NULL) {
         PyErr_SetString(PyExc_TypeError, "missing 'directed' attribute");
+        destroy_nygraph(g);
         return NULL;
     }
     if (PyObject_IsTrue(p)) {
@@ -368,6 +408,7 @@ NyGraph * _make_nygraph(PyObject *py_graph)
     // get the adjacency list dictionary object
     if ((adjdict = PyObject_GetAttrString(py_graph, "adjacency_dict")) == NULL) {
         PyErr_SetString(PyExc_TypeError, "missing 'adjacency_dict' attribute");
+        destroy_nygraph(g);
         return NULL;
     }
 
@@ -375,20 +416,20 @@ NyGraph * _make_nygraph(PyObject *py_graph)
     // the adjacency matrix in the Nauty NyGraph g
     Py_ssize_t pos = 0;
     while (PyDict_Next(adjdict, &pos, &key, &adjlist)) {
-#if PY_MAJOR_VERSION >= 3
-        x = PyLong_AS_LONG(key);
-#else
-        x = PyInt_AS_LONG(key);
-#endif
+        if (!get_vertex(key, n, &x)) {
+            Py_DECREF(adjdict);
+            destroy_nygraph(g);
+            return NULL;
+        }
         adjlist_length =  PyObject_Length(adjlist);
         rowp = GRAPHROW(g->matrix, x, g->no_setwords);
         for (i=0; i < adjlist_length; i++) {
             p = PyList_GET_ITEM(adjlist, i);
-#if PY_MAJOR_VERSION >= 3
-            y = PyLong_AS_LONG(p);
-#else
-            y = PyInt_AS_LONG(p);
-#endif
+            if (!get_vertex(p, n, &y)) {
+                Py_DECREF(adjdict);
+                destroy_nygraph(g);
+                return NULL;
+            }
             ADDELEMENT(rowp, y);
             if (g->options->digraph == FALSE) {
                 ADDELEMENT((GRAPHROW(g->matrix, y, g->no_setwords)), x);
@@ -399,10 +440,11 @@ NyGraph * _make_nygraph(PyObject *py_graph)
     Py_DECREF(adjdict);
 
     // take care of coloring
-    x = set_partition(py_graph, g->lab, g->ptn);
+    x = set_partition(py_graph, g->lab, g->ptn, n);
     if (x < 0) {
         g->options->defaultptn = TRUE;
     } else if (x == 0) {
+        destroy_nygraph(g);
         return 0;
     } else {
         g->options->defaultptn = FALSE;
